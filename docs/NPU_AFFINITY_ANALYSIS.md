@@ -56,6 +56,16 @@ Profiler 结果与模型结构匹配。一次 NPU forward 中耗时靠前的 ker
 
 ## 阻塞项分析
 
+阻塞项按 NPU 复现链路归纳如下。这里的“阻塞”既包括明确运行失败，也包括当前环境缺少真实数据或 checkpoint 形态不明确，导致不能把 smoke 结果外推为完整训练、完整推理或多卡能力。
+
+| 阻塞的复现链路 | 实测现象 | 影响范围 | 判断 |
+| --- | --- | --- | --- |
+| 真实 Koniq10k/KADID-10K/PIPAL 数据集指标复现 | 当前复现环境未提供 README 对应真实数据目录；本轮只能用合成样例验证 Dataset、transform、训练循环和推理入口 | 官方 SRCC/PLCC、完整训练 epoch、真实验证集推理 | 属于数据可用性阻塞，不能把合成样例 smoke 写成官方指标复现。 |
+| NPU 多卡训练 | `ASCEND_RT_VISIBLE_DEVICES=4,5,6,7` 可正确限制可见设备，但 `nn.DataParallel` 在小 Linear 模型上失败；两进程 HCCL `all_reduce` 在 `HCCLUtils.cpp:140` 报 error code `4` | DataParallel、DDP、跨卡梯度同步、分布式训练吞吐 | 属于底层 collective/运行栈阻塞；在 HCCL 最小 all-reduce 通过前，不应迁移 MANIQA 到多卡训练。 |
+| TorchAir 图模式 | `torchair.get_npu_backend()` 可 import，但 tiny model 和 MANIQA 的 `torch.compile` 都在 GE/TBE 初始化阶段失败 | 静态 shape 图编译、host launch 开销优化、图模式性能结论 | 属于图编译环境阻塞；当前只能以 eager NPU 作为可复现路径。 |
+| PIPAL22 推理 checkpoint 形态 | `predict_one_image.py` 使用 state dict 构建模型；`inference.py` 当前按完整模型对象 `torch.load(config.model_path)` 使用 | PIPAL22 challenge 推理脚本的开箱可用性 | 属于 checkpoint 格式契约不明确；如果实际 checkpoint 是 state dict，需要补模型构建和 `load_state_dict` 分支。 |
+| 固定输入尺寸与真实图像预处理 | ViT patch embed 要求 `224x224` 输入；PIPAL22 原图需要通过 five-point crop 后进入模型 | 任意尺寸图片推理、PIPAL22 批量推理、服务化输入校验 | 属于前处理契约阻塞；推理入口必须显式 resize/crop 或拒绝不合规输入。 |
+
 真实数据集指标复现仍被数据路径阻塞。`train_maniqa.py` 和 `inference.py` 默认使用固定数据目录，这些目录在当前复现环境中不可用。本轮只能验证 Dataset 解析、transform、训练循环和推理入口的功能正确性，不能声称已经复现 README 中 Koniq10k、KADID-10K 或 PIPAL22 的 SRCC/PLCC。
 
 多卡训练当前被底层运行栈阻塞。`ASCEND_RT_VISIBLE_DEVICES=4,5,6,7` 能正确限制可见设备，但 `nn.DataParallel` 在 NPU 上失败；进一步用两进程 HCCL 做最小 `all_reduce` 也在 `HCCLUtils.cpp:140` 报 error code `4`。因此在 HCCL 独立 all-reduce 修复前，不应把 MANIQA 训练迁移到 DDP，也不能把失败归因到 MANIQA 模型本身。
@@ -63,6 +73,8 @@ Profiler 结果与模型结构匹配。一次 NPU forward 中耗时靠前的 ker
 TorchAir 图模式当前不可用。`torchair` 已安装，`torchair.get_npu_backend()` 可调用，但 tiny model 和 MANIQA 的 `torch.compile` 都在 GE/TBE 初始化阶段失败，报错涉及 `InitCannKB`、`tbe-custom`、`GEInitializeV2` 和 `ERR03005 GRAPH internal error`。这说明当前容器环境还不满足 TorchAir 编译运行条件，不能把图模式作为本轮复现基线。
 
 PIPAL22 推理 checkpoint 格式也需要明确。`predict_one_image.py` 加载的是 state dict，并手动构建 MANIQA；`inference.py` 当前逻辑是 `torch.load(config.model_path)` 后直接把结果当完整模型对象使用。本轮用随机完整模型对象验证了 `inference.eval_epoch` 和输出文件路径，但如果实际 PIPAL22 checkpoint 是 state dict，`inference.py` 还需要补一个与 `predict_one_image.py` 一致的模型构建和 `load_state_dict` 分支。
+
+固定输入尺寸是推理链路的显式前处理约束。MANIQA 的 ViT patch embed 会检查输入高度和宽度必须为 `224x224`，因此 PIPAL22 原图或任意尺寸用户图片不能直接进入模型。本轮 PIPAL22 入口通过 `inference.eval_epoch` 的 five-point crop 验证可行，但后续如果要做通用推理服务，应在入口处明确 resize/crop 策略和小图拒绝逻辑。
 
 ## 适配建议
 
