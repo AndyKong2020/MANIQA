@@ -4,6 +4,7 @@ torch
 torchvision
 torchsummary
 tensorboardX
+tensorboard
 logging
 tqdm
 json

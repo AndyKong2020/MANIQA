@@ -1,31 +1,17 @@
 import os
 import torch
 import numpy as np
-import random
 
 from torchvision import transforms
 from torch.utils.data import DataLoader
 from config import Config
+from utils.accelerator import get_device, setup_seed
 from utils.inference_process import ToTensor, Normalize, five_point_crop, sort_file
-from data.pipal22_test import PIPAL22
+from data.PIPAL22.pipal22_test import PIPAL22
 from tqdm import tqdm
 
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '5'
-
-
-def setup_seed(seed):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
-
-def eval_epoch(config, net, test_loader):
+def eval_epoch(config, net, test_loader, device):
     with torch.no_grad():
         net.eval()
         name_list = []
@@ -34,7 +20,7 @@ def eval_epoch(config, net, test_loader):
             for data in tqdm(test_loader):
                 pred = 0
                 for i in range(config.num_avg_val):
-                    x_d = data['d_img_org'].cuda()
+                    x_d = data['d_img_org'].to(device)
                     x_d = five_point_crop(i, d_img=x_d, config=config)
                     pred += net(x_d)
 
@@ -58,13 +44,15 @@ if __name__ == '__main__':
     os.environ['NUMEXPR_NUM_THREADS'] = str(cpu_num)
     torch.set_num_threads(cpu_num)
 
+    os.environ['PYTHONHASHSEED'] = str(20)
     setup_seed(20)
+    device = get_device()
 
     # config file
     config = Config({
         # dataset path
         "db_name": "PIPAL",
-        "test_dis_path": "/mnt/data_16TB/ysd21/IQA/NTIRE2022_NR_Valid_Dis/",
+        "test_dis_path": "./data/PIPAL22/NTIRE2022_NR_Valid_Dis/",
         
         # optimization
         "batch_size": 10,
@@ -85,7 +73,7 @@ if __name__ == '__main__':
 
     if not os.path.exists(config.valid_path):
         os.mkdir(config.valid_path)
-    
+
     # data load
     test_dataset = PIPAL22(
         dis_path=config.test_dis_path,
@@ -98,10 +86,12 @@ if __name__ == '__main__':
         drop_last=True,
         shuffle=False
     )
-    net = torch.load(config.model_path)
-    net = net.cuda()
+    try:
+        net = torch.load(config.model_path, map_location='cpu', weights_only=False)
+    except TypeError:
+        net = torch.load(config.model_path, map_location='cpu')
+    net = net.to(device)
 
     losses, scores = [], []
-    eval_epoch(config, net, test_loader)
+    eval_epoch(config, net, test_loader, device)
     sort_file(config.valid_path + '/output.txt')
-    

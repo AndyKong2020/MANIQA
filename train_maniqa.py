@@ -4,32 +4,18 @@ import numpy as np
 import logging
 import time
 import torch.nn as nn
-import random
 
 from torchvision import transforms
 from torch.utils.data import DataLoader
 from models.maniqa import MANIQA
 from config import Config
+from utils.accelerator import get_device, maybe_data_parallel, setup_seed, unwrap_model
 from utils.process import RandCrop, ToTensor, Normalize, five_point_crop
 from utils.process import split_dataset_kadid10k, split_dataset_koniq10k
 from utils.process import RandRotation, RandHorizontalFlip
 from scipy.stats import spearmanr, pearsonr
 from torch.utils.tensorboard import SummaryWriter 
 from tqdm import tqdm
-
-
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
-
-
-def setup_seed(seed):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
 
 
 def set_logging(config):
@@ -45,7 +31,7 @@ def set_logging(config):
     )
 
 
-def train_epoch(epoch, net, criterion, optimizer, scheduler, train_loader):
+def train_epoch(epoch, net, criterion, optimizer, scheduler, train_loader, device):
     losses = []
     net.train()
     # save data for one epoch
@@ -53,10 +39,10 @@ def train_epoch(epoch, net, criterion, optimizer, scheduler, train_loader):
     labels_epoch = []
     
     for data in tqdm(train_loader):
-        x_d = data['d_img_org'].cuda()
+        x_d = data['d_img_org'].to(device)
         labels = data['score']
 
-        labels = torch.squeeze(labels.type(torch.FloatTensor)).cuda()  
+        labels = torch.squeeze(labels.type(torch.FloatTensor)).to(device)
         pred_d = net(x_d)
 
         optimizer.zero_grad()
@@ -83,7 +69,7 @@ def train_epoch(epoch, net, criterion, optimizer, scheduler, train_loader):
     return ret_loss, rho_s, rho_p
 
 
-def eval_epoch(config, epoch, net, criterion, test_loader):
+def eval_epoch(config, epoch, net, criterion, test_loader, device):
     with torch.no_grad():
         losses = []
         net.eval()
@@ -94,9 +80,9 @@ def eval_epoch(config, epoch, net, criterion, test_loader):
         for data in tqdm(test_loader):
             pred = 0
             for i in range(config.num_avg_val):
-                x_d = data['d_img_org'].cuda()
+                x_d = data['d_img_org'].to(device)
                 labels = data['score']
-                labels = torch.squeeze(labels.type(torch.FloatTensor)).cuda()
+                labels = torch.squeeze(labels.type(torch.FloatTensor)).to(device)
                 x_d = five_point_crop(i, d_img=x_d, config=config)
                 pred += net(x_d)
 
@@ -128,7 +114,9 @@ if __name__ == '__main__':
     os.environ['NUMEXPR_NUM_THREADS'] = str(cpu_num)
     torch.set_num_threads(cpu_num)
 
+    os.environ['PYTHONHASHSEED'] = str(20)
     setup_seed(20)
+    device = get_device()
 
     # config file
     config = Config({
@@ -178,6 +166,7 @@ if __name__ == '__main__':
         "num_outputs": 1,
         "num_tab": 2,
         "scale": 0.8,
+        "vit_pretrained": True,
         
         # load & save checkpoint
         "model_name": "koniq10k-base_s20",
@@ -271,12 +260,13 @@ if __name__ == '__main__':
     # model defination
     net = MANIQA(embed_dim=config.embed_dim, num_outputs=config.num_outputs, dim_mlp=config.dim_mlp,
         patch_size=config.patch_size, img_size=config.img_size, window_size=config.window_size,
-        depths=config.depths, num_heads=config.num_heads, num_tab=config.num_tab, scale=config.scale)
+        depths=config.depths, num_heads=config.num_heads, num_tab=config.num_tab, scale=config.scale,
+        vit_pretrained=config.vit_pretrained)
 
     logging.info('{} : {} [M]'.format('#Params', sum(map(lambda x: x.numel(), net.parameters())) / 10 ** 6))
 
-    net = nn.DataParallel(net)
-    net = net.cuda()
+    net = maybe_data_parallel(net, device)
+    net = net.to(device)
 
     # loss function
     criterion = torch.nn.MSELoss()
@@ -295,7 +285,7 @@ if __name__ == '__main__':
     for epoch in range(0, config.n_epoch):
         start_time = time.time()
         logging.info('Running training epoch {}'.format(epoch + 1))
-        loss_val, rho_s, rho_p = train_epoch(epoch, net, criterion, optimizer, scheduler, train_loader)
+        loss_val, rho_s, rho_p = train_epoch(epoch, net, criterion, optimizer, scheduler, train_loader, device)
 
         writer.add_scalar("Train_loss", loss_val, epoch)
         writer.add_scalar("SRCC", rho_s, epoch)
@@ -304,7 +294,7 @@ if __name__ == '__main__':
         if (epoch + 1) % config.val_freq == 0:
             logging.info('Starting eval...')
             logging.info('Running testing in epoch {}'.format(epoch + 1))
-            loss, rho_s, rho_p = eval_epoch(config, epoch, net, criterion, val_loader)
+            loss, rho_s, rho_p = eval_epoch(config, epoch, net, criterion, val_loader, device)
             logging.info('Eval done...')
 
             if rho_s + rho_p > main_score:
@@ -319,7 +309,7 @@ if __name__ == '__main__':
                 # save weights
                 model_name = "epoch{}.pt".format(epoch + 1)
                 model_save_path = os.path.join(config.ckpt_path, model_name)
-                torch.save(net.module.state_dict(), model_save_path)
+                torch.save(unwrap_model(net).state_dict(), model_save_path)
                 logging.info('Saving weights and model of epoch{}, SRCC:{}, PLCC:{}'.format(epoch + 1, best_srocc, best_plcc))
         
         logging.info('Epoch {} done. Time: {:.2}min'.format(epoch + 1, (time.time() - start_time) / 60))

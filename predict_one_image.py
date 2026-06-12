@@ -1,29 +1,15 @@
 import os
 import torch
 import numpy as np
-import random
 import cv2
 
 from torchvision import transforms
 from models.maniqa import MANIQA
 from torch.utils.data import DataLoader
 from config import Config
+from utils.accelerator import get_device, setup_seed
 from utils.inference_process import ToTensor, Normalize
 from tqdm import tqdm
-
-
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-
-
-def setup_seed(seed):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
 
 
 class Image(torch.utils.data.Dataset):
@@ -68,12 +54,14 @@ if __name__ == '__main__':
     os.environ['NUMEXPR_NUM_THREADS'] = str(cpu_num)
     torch.set_num_threads(cpu_num)
 
+    os.environ['PYTHONHASHSEED'] = str(20)
     setup_seed(20)
+    device = get_device()
 
     # config file
     config = Config({
         # image path
-        "image_path": "./test_images/kunkun.png",
+        "image_path": "./image/kunkun.png",
 
         # valid times
         "num_crops": 20,
@@ -89,11 +77,12 @@ if __name__ == '__main__':
         "num_outputs": 1,
         "num_tab": 2,
         "scale": 0.8,
+        "vit_pretrained": False,
 
         # checkpoint path
         "ckpt_path": "./ckpt_koniq10k.pt",
     })
-    
+
     # data load
     Img = Image(image_path=config.image_path,
         transform=transforms.Compose([Normalize(0.5, 0.5), ToTensor()]),
@@ -102,21 +91,20 @@ if __name__ == '__main__':
     # model defination
     net = MANIQA(embed_dim=config.embed_dim, num_outputs=config.num_outputs, dim_mlp=config.dim_mlp,
         patch_size=config.patch_size, img_size=config.img_size, window_size=config.window_size,
-        depths=config.depths, num_heads=config.num_heads, num_tab=config.num_tab, scale=config.scale)
+        depths=config.depths, num_heads=config.num_heads, num_tab=config.num_tab, scale=config.scale,
+        vit_pretrained=config.vit_pretrained)
 
-    net.load_state_dict(torch.load(config.ckpt_path), strict=False)
-    net = net.cuda()
+    net.load_state_dict(torch.load(config.ckpt_path, map_location='cpu'), strict=False)
+    net = net.to(device)
 
     avg_score = 0
     for i in tqdm(range(config.num_crops)):
         with torch.no_grad():
             net.eval()
             patch_sample = Img.get_patch(i)
-            patch = patch_sample['d_img_org'].cuda()
+            patch = patch_sample['d_img_org'].to(device)
             patch = patch.unsqueeze(0)
             score = net(patch)
             avg_score += score
-        
-    print("Image {} score: {}".format(Img.img_name, avg_score / config.num_crops))
 
-    
+    print("Image {} score: {}".format(Img.img_name, avg_score / config.num_crops))

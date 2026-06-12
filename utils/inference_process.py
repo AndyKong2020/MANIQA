@@ -2,16 +2,17 @@ import torch
 import numpy as np
 
 
-def sort_file(file_path):
-    f2 = open(file_path, "r")
-    lines = f2.readlines()
+def sort_file(file_path, output_path=None):
+    with open(file_path, "r") as f2:
+        lines = f2.readlines()
     ret = []
     for line in lines:
         line = line[:-1]
         ret.append(line)
     ret.sort()
 
-    with open('./output.txt', 'w') as f:
+    output_path = output_path or file_path
+    with open(output_path, 'w') as f:
         for i in ret:
             f.write(i + '\n')
 
