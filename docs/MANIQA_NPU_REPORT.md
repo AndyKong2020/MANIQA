@@ -16,7 +16,7 @@
 ## 1. 技术栈梳理
 - 主语言:Python。
 - ML 框架:PyTorch eager,通过 torch_npu 接入 Ascend NPU。
-- CUDA 依赖:原仓库训练、预测、推理脚本硬编码 `.cuda()` 与 `CUDA_VISIBLE_DEVICES`;本轮已改为 `get_device()` / `.to(device)`。无必须 CUDA 自定义核。
+- CUDA 依赖:原仓库训练、预测、推理脚本硬编码 `.cuda()` 与 `CUDA_VISIBLE_DEVICES`;适配后统一使用 `get_device()` / `.to(device)`。无必须 CUDA 自定义核。
 - 自定义核(.cu / C++ 扩展):无。仓库内主要是 PyTorch、torchvision、OpenCV、NumPy、timm vendored 代码。
 - 第三方库:torchvision、opencv-python-headless、scipy、pandas、einops、tensorboardX、tensorboard、tqdm、torchsummary。
 - 模型权重 / 来源:官方 Koniq10k checkpoint,文件 `ckpt_koniq10k.pt`,大小 `543335435` bytes,SHA256 `a207f8ab57322e6be38ff5c8d019301dc032b454bef21c3c9f9dbf7974eebff6`。
@@ -37,24 +37,24 @@ python predict_one_image.py
 ```
 
 ## 3. 验证用例
-- 输入数据:仓库 README 示例图 `image/kunkun.png`、`bird.jpg`、`dog.jpg`、`ball.jpg`、`people.jpg`;合成 Koniq/KADID/PIPAL/PIPAL22 小样例用于 Dataset 与训练/推理入口 smoke。
+- 输入数据:仓库 README 示例图 `image/kunkun.png`、`bird.jpg`、`dog.jpg`、`ball.jpg`、`people.jpg`;合成 Koniq/KADID/PIPAL/PIPAL22 小样例用于 Dataset 与训练/推理入口功能验证。
 - 运行命令:
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 python predict_one_image.py
 ```
 - 期望输出:单图质量分可在 NPU 上输出,与 README 示例数值接近。
 - 实测输出:`Image kunkun.png score: tensor([0.3407], device='npu:0')`。
-- 与 CPU/GPU 基准对比(误差/一致性):本轮以 README 公开示例分数作为 sanity check;README 五图 NPU 20-crop 结果为 `kunkun 0.340658`、`bird 0.261935`、`dog 0.308199`、`ball 0.372101`、`people 0.358600`,与 README 示例 `0.3398/0.2612/0.3078/0.3716/0.3581` 接近。
-- 训练 smoke:合成 Koniq DataLoader 跑通 `train_epoch` 与 `eval_epoch`,覆盖 forward、MSE loss、backward、Adam、CosineAnnealingLR、SRCC/PLCC 统计;样例 `train_loss=0.4549516`,`eval_loss=0.2429362`。
-- PIPAL22 smoke:`PIPAL22` Dataset 可读目录图片;入口需 five-point crop 到 `224x224`;输出文件可原地排序,未再生成根目录 `output.txt`。
+- 与 CPU/GPU 基准对比(误差/一致性):以 README 公开示例分数作为一致性参照;README 五图 NPU 20-crop 结果为 `kunkun 0.340658`、`bird 0.261935`、`dog 0.308199`、`ball 0.372101`、`people 0.358600`,与 README 示例 `0.3398/0.2612/0.3078/0.3716/0.3581` 接近。
+- 训练入口验证:合成 Koniq DataLoader 跑通 `train_epoch` 与 `eval_epoch`,覆盖 forward、MSE loss、backward、Adam、CosineAnnealingLR、SRCC/PLCC 统计;样例 `train_loss=0.4549516`,`eval_loss=0.2429362`。
+- PIPAL22 推理入口验证:`PIPAL22` Dataset 可读目录图片;入口需 five-point crop 到 `224x224`;输出文件可原地排序,未再生成根目录 `output.txt`。
 
 ## 4. NPU 亲和性
 
 | 指标 | 数值 |
 |---|---|
-| 能否在 NPU 跑通 | 是。单图 checkpoint 预测、随机 forward、训练/验证 smoke、PIPAL22 推理入口均跑通 |
-| NPU 利用率 (npu-smi) | 短 forward 任务不适合用瞬时 `npu-smi` 利用率代表性能,本报告不填伪利用率 |
-| HBM 占用 | 共享环境当前存在其他进程占用,本报告不填写会被其他任务污染的峰值 HBM |
+| 能否在 NPU 跑通 | 是。单图 checkpoint 预测、随机 forward、训练/验证入口、PIPAL22 推理入口均跑通 |
+| NPU 利用率 (npu-smi) | 短 forward 任务不适合用瞬时 `npu-smi` 利用率代表性能;不采用瞬时利用率作为性能指标 |
+| HBM 占用 | HBM 峰值受其他进程污染,不作为该任务指标 |
 | 关键算子是否回退 CPU | 主干未观察到硬 CPU 回退;CPU 路径主要是 OpenCV/NumPy 预处理与 SRCC/PLCC 统计 |
 | 性能(吞吐/时延) | 随机权重 forward:batch1 `13.78 ms/image`,batch4 `3.93 ms/image`,batch8 `2.12 ms/image`;checkpoint 单图 20-crop 输出正常 |
 
@@ -66,16 +66,16 @@ ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 python predict_one_image.py
 | 单元 | 压力 | 判定 | 证据 |
 |---|---|---|---|
 | 算力(Cube,矩阵卷积) | 高。ViT dense、TAB `q@k.T/attn@v`、Swin projection、Conv2d 是主计算 | 亲和 | profiler 中 Addmm/MatMul/BatchMatMul/Conv2d 为主要耗时;模型主干为规则 dense tensor 计算 |
-| 向量(Vector,归一激活) | 中到高。Softmax、LayerNorm、GELU、Add/Mul、score reduce | 可用 | Softmax/LayerNorm/GELU 均在 NPU 跑通;当前证据不足以把 Vector 写成最终瓶颈 |
-| 搬运(MTE/FixPipe) | 中。rearrange/transpose/window layout 与 H2D 输入搬运 | 有优化空间 | profiler 观察到 Transpose kernel;OpenCV/NumPy 预处理在 CPU,layout 折叠/NDDMA 不作为本轮结论 |
+| 向量(Vector,归一激活) | 中到高。Softmax、LayerNorm、GELU、Add/Mul、score reduce | 可用 | Softmax/LayerNorm/GELU 均在 NPU 跑通;现有证据不足以把 Vector 判为最终瓶颈 |
+| 搬运(MTE/FixPipe) | 中。rearrange/transpose/window layout 与 H2D 输入搬运 | 有优化空间 | profiler 观察到 Transpose kernel;OpenCV/NumPy 预处理在 CPU,layout 折叠/NDDMA 未纳入定量结论 |
 | 通信(communication) | 单卡无通信;多卡阻塞 | 单卡可用,多卡不可声明 | 后四卡隔离有效;`nn.DataParallel` 小 Linear 失败,HCCL `all_reduce` 报 `HCCLUtils.cpp:140` error code `4` |
-| 调度(host/head) | 高。PyTorch eager、小 kernel、20-crop 串行、score head Python loop | 当前主要工程风险 | batch 越大 `ms/image` 越低,说明 launch/head 被摊薄;score head 仍逐样本 `torch.cat` |
+| 调度(host/head) | 高。PyTorch eager、小 kernel、20-crop 串行、score head Python loop | 主要工程风险 | batch 越大 `ms/image` 越低,说明 launch/head 被摊薄;score head 仍逐样本 `torch.cat` |
 
 **roofline 初判**:
-- 口径:Ascend950PR,架构 3510,当前实测 FP32 eager;本报告不把 FP32 Cube/Vector 平衡点和 GM bytes 写成定量结论。
+- 口径:Ascend950PR,架构 3510,实测口径为 FP32 eager;FP32 Cube/Vector 平衡点和 GM bytes 不作为定量结论。
 - FP16 Cube 平衡点参考约 `270 FLOP/Byte`;MANIQA 的 ViT/TAB 大矩阵段具备百级 FLOP/Byte 的复用,主干比图像预处理和 score head 更贴 NPU。
 - Swin window attention 的 window size 为 4,单 window 16 token,小矩阵 tile 利用率与 kernel head 可能主导,不能只按总 FLOPs 判断。
-- 端到端可写为 `T_image ≈ T_preprocess_CPU + T_H2D + T_head_eager + max(T_GM_layout, T_Cube主干 + T_Vector后处理)`;当前 batch 变大后单图耗时下降,说明 `T_head_eager` 不可忽略。
+- 端到端可写为 `T_image ≈ T_preprocess_CPU + T_H2D + T_head_eager + max(T_GM_layout, T_Cube主干 + T_Vector后处理)`;batch 变大后单图耗时下降,说明 `T_head_eager` 不可忽略。
 
 ## 5. 阻塞项
 
@@ -87,13 +87,13 @@ ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 python predict_one_image.py
 **非阻塞优化项**:
 - score head 逐样本 `fc_score/fc_weight` + `torch.cat` 会放大小 kernel/head 开销,但功能已跑通;可用数学等价向量化:`(f*w).sum(dim=(1,2))/w.sum(dim=(1,2))`。
 - README 单图预测逐 crop forward,结果稳定但吞吐不优;可把 20 个 crop stack 成 batch 后一次或分批 forward。
-- PIPAL22 推理脚本 checkpoint 形态建议兼容 state dict / 完整模型对象双分支,这是开箱易用性问题,不是 NPU 阻塞。
+- PIPAL22 推理脚本 checkpoint 形态可兼容 state dict / 完整模型对象双分支,这是易用性问题,不是 NPU 阻塞。
 - ViT patch embed 要求 `224x224`;入口应显式 resize/crop 或拒绝小图,这是输入契约,不是 NPU 阻塞。
-- vendored timm 存在 `np.bool` 旧别名风险,默认 MANIQA 路径未触发;建议固定 `numpy<2` 或修旧别名。
+- vendored timm 存在 `np.bool` 旧别名风险,默认 MANIQA 路径未触发;可固定 `numpy<2` 或修旧别名。
 
 ## 6. 结论
 - 运行方案(NPU / NPU+CPU / CPU):NPU+CPU。MANIQA 主干和训练/预测核心 tensor 路径跑在 NPU;图像读取/预处理、相关系数统计等仍在 CPU。
-- 单 NPU eager 可复现:checkpoint 单图预测、README 五图、随机 forward、训练/验证 smoke、PIPAL22 推理入口均通过。
+- 单 NPU eager 可复现:checkpoint 单图预测、README 五图、随机 forward、训练/验证入口、PIPAL22 推理入口均通过。
 - NPU 亲和判断:主干 ViT/TAB/Swin dense 计算亲和 NPU;Vector 路径可用;MTE/layout 和 host/head 是主要优化面。
-- 后续优化:score head 向量化、20-crop batch 化、真实业务批量吞吐采样。
-- 不建议表述:不能宣称多卡 DDP 或 TorchAir 图模式已完成复现。
+- 优化方向:score head 向量化、20-crop batch 化、真实业务批量吞吐采样。
+- 结论边界:多卡 DDP 与 TorchAir 图模式未完成复现。
