@@ -1,58 +1,101 @@
 # MANIQA NPU 亲和性分析
 
-生成日期：2026-06-12
+生成日期：2026-06-16
+
+## 绑定口径
+
+本报告按 Ascend NPU 亲和性分析流程重刷，结论只绑定下表环境，不外推到其他 NPU 架构、其他 dtype 或多卡配置。
+
+| 项目 | 口径 |
+| --- | --- |
+| 目标平台 | Ascend950PR |
+| NPU 架构版本 | 3510，分离式 AIC/AIV，AIC:AIV=1:2，支持 Regbase AIV、SIMT、NDDMA 等 950 系列能力 |
+| 运行栈 | CANN 9.0.0，`torch 2.10.0+cpu`，`torch_npu 2.10.0`，PyTorch eager |
+| 实测 dtype | FP32 eager 为主；BF16 autocast 只做 smoke，未形成精度/性能结论 |
+| 任务阶段 | 图像推理与训练 smoke；MANIQA 不是 token 模型，prefill/decode 口径不适用 |
+| 设备约束 | 只使用物理后四张 NPU；进程内可见 `npu:0..3`，主验证路径使用逻辑 `npu:0` |
+| GPU 对比 | 本版不做 NVIDIA GPU 横向定量对比 |
 
 ## 分析结论
 
-MANIQA 在 Ascend950PR、CANN 9.0.0、`torch_npu 2.10.0` 环境下具备较好的单 NPU eager 亲和性。模型主干由 ViT patch embedding、Transformer MLP、TAB 通道注意力、Swin window attention、LayerNorm、Softmax、GELU、Conv2d 和 Linear 组成，重计算集中在 MatMul/AddMM/BatchMatMul/Conv2d/Softmax/LayerNorm/GELU 这类 Ascend NPU 友好的 tensor 和 vector 算子上。实测 checkpoint 预测、README 五图预测、随机 forward、训练 backward、PIPAL22 推理入口和 profiler 均能在后四卡隔离环境下工作。
+MANIQA 在 Ascend950PR、CANN 9.0.0、`torch_npu 2.10.0`、FP32 eager 环境下具备较好的单 NPU 亲和性。模型主干由 ViT patch embedding、Transformer MLP、TAB 通道注意力、Swin window attention、LayerNorm、Softmax、GELU、Conv2d 和 Linear 组成，重计算集中在 MatMul/AddMM/BatchMatMul/Conv2d/Softmax/LayerNorm/GELU 这类 Ascend NPU 可有效承载的 Cube 与 Vector 路径上。
 
-但这个项目不能简单归类为“全量 NPU 原生高性能”。当前风险集中在四类路径：第一类是 CPU-bound 图像数据管线，OpenCV/NumPy 读取、resize、随机裁剪和 normalize 仍在 CPU 执行；第二类是模型 score head 仍包含 Python batch loop 和逐样本 `torch.cat`，功能正确但不利于大 batch 和图模式；第三类是多卡和图模式环境尚未打通，`DataParallel`、HCCL `all_reduce` 和 TorchAir 编译都失败；第四类是复现工程问题，包括真实数据路径硬编码、训练入口缺少 `tensorboard` 依赖声明、NumPy 2.x 对 vendored timm 的潜在兼容风险，以及 224 固定输入尺寸对推理图片的约束。
+但这个项目不能简单写成“全量 NPU 原生高性能”。MANIQA 的主干矩阵计算贴合 Cube 路径，Vector 路径也能承载 Softmax、LayerNorm、GELU 和 reduce；真正限制来自五类边界：CPU 图像数据管线、score head Python loop、小窗口 attention 和大量小 kernel 带来的 host/head 开销、PIPAL22/checkpoint 工程契约、多卡 HCCL 和 TorchAir 图模式环境阻塞。当前结论应定位为：单 NPU eager 可复现，完整训练吞吐、多卡训练、图模式优化和真实数据集指标仍需专项验证。
 
-因此，本次结论是：MANIQA 的核心视觉 Transformer 推理和单卡训练计算对 Ascend950PR 适配度高，适合作为单 NPU eager 复现目标；完整训练吞吐、多卡训练、TorchAir 图优化和真实数据集指标复现仍需要专项处理后才能作为稳定交付。
+## 五路径拆解
+
+| 路径 | 压力判断 | 关键证据 | 亲和性判断 | 流程依据 |
+| --- | --- | --- | --- | --- |
+| Cube | 高。ViT dense、TAB 的 `q @ k.T` / `attn @ v`、Swin projection、Conv2d 是主计算路径。 | profiler 中 `aclnnAddmm` 90 次约 `2806 us`、`BatchMatMul` 40 次约 `818 us`、`Conv2d` 7 次约 `690 us`、`MatMul` 14 次约 `637 us`。 | 主干亲和较好；大矩阵段适合 Cube，但小窗口 attention 的 tile 利用率需单独测。 | 原流程实测。 |
+| Vector | 中到高。Softmax、LayerNorm、GELU、ReLU/Sigmoid、score reduce、dropout/elementwise 都走 Vector 或相关路径。 | profiler 中 Softmax 24 次约 `241 us`、LayerNorm 41 次约 `156 us`、GELU 20 次约 `136 us`，并有 Add/Mul 等 elementwise kernel。 | 功能亲和可用；Vector 不是瓶颈结论前需要 `aiv_vec_time` 和 GM bytes。 | 原流程实测。 |
+| MTE/FixPipe | 中。模型内部存在 transpose/rearrange、patch/window layout 变化和 H2D 输入搬运；PyTorch eager 下未确认 NDDMA/layout 折叠。 | profiler 中 `TransposeAiCore` 30 次约 `330 us`；OpenCV/NumPy 预处理在 CPU，进入 NPU 前有 host 到 device 传输。 | 可运行但有搬运和小包风险；layout 是否能折叠为地址生成或持久 layout 属于待测项。 | 原流程实测，layout 折叠为重写待测。 |
+| communication | 单 NPU 路径无压力；多卡路径阻塞。 | `ASCEND_RT_VISIBLE_DEVICES=4,5,6,7` 可正确隔离设备；`nn.DataParallel` 和两进程 HCCL `all_reduce` 当前失败。 | 单卡可用；多卡不可声明可用，需先修 HCCL 最小 collective。 | 原流程实测。 |
+| host/head | 高。PyTorch eager、20-crop 串行预测、score head Python loop 和大量小 kernel 会放大 launch/head 开销。 | batch 1 约 `13.78 ms/image`，batch 8 降到约 `2.12 ms/image`；score head 逐样本 `torch.cat`；README 单图预测是 20 次 crop 串行 forward。 | 当前最大工程优化面；优先 batch 化和向量化，再考虑图模式。 | 原流程实测；batch 化/向量化为等价重写建议。 |
+
+## 理论量化与 roofline 初判
+
+本节只做粗 roofline 初判，不把理论值写成承诺性能。时间模型按：
+
+```text
+T_segment ≈ T_head + max(T_GM, T_Cube_or_Vector)
+```
+
+矩阵路径应和 Cube 平衡点比较，向量/reduce/layout 路径应和 Vector 或 GM 搬运比较，不能混用。按本报告采用的亲和性分析参考框架，950PR 的 FP16 Cube 平衡点约为 `270 FLOP/Byte`；本轮实测主口径是 FP32 eager，缺少可核验的 950PR FP32 Cube/Vector 峰值与实际 GM bytes，因此 FP32 精确平衡点标为 `待测`。下表中的算术密度是基于 MANIQA 形状的数量级估算，不含 cache、tile、mask、layout 和 runtime overlap 效率。
+
+| 子段 | 形状/工作量口径 | 主导路径 | 算术密度 vs 平衡点 | 初判 |
+| --- | --- | --- | --- | --- |
+| ViT patch embedding 与 dense/MLP | 输入 `224x224`，patch size 8，token 数 `28x28=784`，hidden dim 768 | Cube + MTE | dense/MLP 具备较高复用；按典型 `[784,768] x [768,*]` 估算为百级 FLOP/Byte，接近或低于 FP16 Cube 平衡点，FP32 平衡点待测 | 主干可贴 Cube，但仍可能受权重/激活 GM 搬运影响。 |
+| TAB stage 1 | concat 4 层 ViT token 后约 `[B,3072,784]`，`q@k.T` 形成 `[B,3072,3072]` | Cube + Vector Softmax | `q@k.T` 按 FP32 读写粗估约 `260 FLOP/Byte`，接近 950PR FP16 Cube 平衡点；Softmax 是 Vector/GM 路径 | 矩阵段亲和好，Softmax 与大 attention map 物化是待测风险。 |
+| TAB stage 2 | 约 `[B,768,784]`，`q@k.T` 形成 `[B,768,768]` | Cube + Vector Softmax | 粗估百级 FLOP/Byte，低于 stage 1；tile 更小，head 占比更高 | 中等亲和；需要 profiler GM bytes 和 tile 利用率确认。 |
+| Swin window attention | window size 4，单 window 16 token，窗口数约 49 | 小 Cube + Vector/head | attention 矩阵很小，理论 FLOPs 不大；小 GEMM tile 利用率与 launch/head 可能主导 | 亲和中等；linear projection 比 window attention 本体更贴 Cube。 |
+| score head | `[B,784,C]` 上 `fc_score/fc_weight` 后 reduce；当前逐样本 Python loop | Vector + host/head | small MLP 和 reduce 算术密度不高；反复 `torch.cat` 放大小包和 head 开销 | 原流程亲和差；应做等价向量化。 |
+| 图像预处理与 H2D | OpenCV/NumPy 读图、resize/crop/normalize，再传 NPU | host + MTE | NPU 算术密度为 0；真实训练吞吐取决于 CPU worker、H2D 和 batch | 不是 NPU kernel 问题，但会限制端到端吞吐。 |
+
+模型级推理可分为：
+
+```text
+T_image ≈ T_preprocess_CPU + T_H2D + T_head_eager + max(T_GM_layout, T_Cube主干 + T_Vector后处理)
+```
+
+当前实测 batch 变大后 `ms/image` 明显下降，说明 `T_head_eager` 和小 kernel 开销不可忽略。真实训练还要额外叠加 DataLoader、CPU 增强、反向传播、optimizer 和 CPU 侧 SRCC/PLCC 统计；这些不能从单 forward profiler 直接外推。
+
+## NPU 特有亲和项自检
+
+| 项目 | 当前观察 | 风险与待测 |
+| --- | --- | --- |
+| tile 驻留与 double buffer | ViT/TAB 大矩阵段理论上具备 tile 复用；Swin window attention tile 小。 | 缺 L0/L1/UB tile 利用率和 double buffer 效率数据，需用 CANN profiler 或 microbench 补证。 |
+| 32B/512B 对齐与小包 | 3510 口径下 UB 32B、L0 分形 512B；PyTorch eager 隐藏了底层 copy 切分。 | 不能套用 A2 的 GM 512B 规则；950 L2 cacheline/sector 行为和实际小包效率待测。 |
+| repeat/mask 密度 | Softmax/LayerNorm/GELU 可运行；score reduce 和 window attention 存在小向量/小矩阵。 | 需要 `aiv_vec_time`、mask 利用率和小 shape microbench 判断 Vector 是否低效。 |
+| layout 折叠 | 代码中大量 `einops.rearrange`、window partition、transpose；部分可能是 view，部分触发真实 transpose kernel。 | 已观察 `TransposeAiCore`；哪些 layout 能折叠为地址生成、stride copy、NDDMA 或持久 layout 需要逐段确认。 |
+| reduce/state layout | score head 对 patch 维度做加权 reduce；训练指标 SRCC/PLCC 在 CPU 侧统计。 | score reduce 可向量化；SRCC/PLCC 若要 NPU 化，需要单独设计排序/统计路径。 |
+| 同步边界 | PyTorch eager 每个 kernel 有 launch/head；20-crop 预测是 Python 串行循环。 | 跨 kernel 硬同步无法通过“少一次 view”消除；收益主要来自 batch 化、向量化和图模式。 |
+| 通信边界 | 单卡无通信；多卡 HCCL 当前失败。 | DDP 前必须先让最小 `all_reduce` 通过，否则 MANIQA 上层没有可靠多卡结论。 |
 
 ## 已验证的 NPU 计算路径
 
-本次实测的 NPU 友好路径比较清晰。`predict_one_image.py` 使用 Koniq10k checkpoint 在 NPU 上完成 20-crop 单图预测，README 中五张示例图也完成复现：`kunkun.png 0.340658`、`bird.jpg 0.261935`、`dog.jpg 0.308199`、`ball.jpg 0.372101`、`people.jpg 0.358600`。这些分数与 README 中 `0.3398/0.2612/0.3078/0.3716/0.3581` 接近，说明 checkpoint 加载、图像预处理、模型主干和 score head 在 NPU 上可以给出合理结果。
+| 能力范围 | 实测结果 |
+| --- | --- |
+| NPU 环境与设备隔离 | `ASCEND_RT_VISIBLE_DEVICES=4,5,6,7` 下 `torch.npu.device_count() == 4`，默认计算设备为 `npu:0`。 |
+| 单图 checkpoint 预测 | `python predict_one_image.py` 在 NPU 上成功运行，`kunkun.png` 输出约 `0.3407`，与 README 中 `0.3398` 接近。 |
+| README 五张示例图 | 使用 Koniq10k checkpoint、20-crop 路径，在 NPU 上得到 `kunkun 0.340658`、`bird 0.261935`、`dog 0.308199`、`ball 0.372101`、`people 0.358600`，与 README 示例数值一致。 |
+| 模型 forward | 使用项目默认 MANIQA 配置，随机 `1x3x224x224` NPU 输入可得到 `torch.Size([1])` 输出。 |
+| batch 推理吞吐 | 随机权重 forward 计时：batch 1 约 `13.78 ms/image`，batch 4 约 `3.93 ms/image`，batch 8 约 `2.12 ms/image`。 |
+| 训练/验证 epoch | 使用 Koniq 合成 DataLoader 和随机权重模型，`train_epoch`、`eval_epoch` 在 NPU 上完成 forward/backward/Adam/scheduler 和 SRCC/PLCC 计算。 |
+| BF16 autocast | BF16 autocast smoke 通过，但最终 score tensor 仍为 `float32`，尚未做精度收益结论。 |
+| NPU profiler | `torch_npu.profiler` 可生成 CANN trace，top kernel 与 ViT/TAB/Swin 结构匹配。 |
+| 多卡和图模式 | `DataParallel`、HCCL `all_reduce`、TorchAir graph mode 当前均未通过。 |
 
-模型 forward 覆盖了完整 MANIQA 结构。ViT backbone 通过 forward hook 取第 6 到第 9 个 Transformer block 的 patch token，随后进入 TABlock 的 `q @ k.transpose`、Softmax 和 `attn @ v`，再进入两级 SwinTransformer 局部窗口建模，最后通过 `fc_score` 与 `fc_weight` 做 patch 加权质量分。随机输入、checkpoint 输入和训练输入都验证了这个路径可以在 `npu:0` 上执行。
+## 不亲和点与等价重写
 
-训练路径也已覆盖到 autograd 和优化器。使用合成 Koniq10k DataLoader 跑 `train_epoch`，NPU 上完成 forward、MSE loss、backward、Adam step、CosineAnnealingLR step 和 CPU 侧 SRCC/PLCC 统计；随后 `eval_epoch` 也完成 five-point crop、forward 和 loss/相关系数统计。这个结果说明训练入口的 NPU 设备迁移是可用的，但不能替代真实 Koniq/KADID/PIPAL 训练指标。
+| 原流程问题 | 数学等价/工程重写 | 预期收益 | 验证要求 |
+| --- | --- | --- | --- |
+| score head 逐样本 loop + `torch.cat` | 将 `fc_score(x)`、`fc_weight(x)` 保持为 `[B,N,1]`，直接按 patch 维 reduce：`score = (f*w).sum(dim=(1,2)) / w.sum(dim=(1,2))` | 减少 Python loop、小 kernel、cat 物化和 host/head 开销 | 用 README 五图和 checkpoint 单图对齐，误差应仅为浮点舍入级。 |
+| 20-crop 串行 forward | 将 20 个 crop stack 成 batch，一次或分批送入模型后平均 | 摊薄 launch/head，提升端到端单图预测吞吐 | 与串行 20-crop 结果逐图对齐，记录显存峰值。 |
+| PIPAL22 推理 checkpoint 形态不统一 | 增加 state dict 与完整模型对象两种加载分支 | 提升 challenge 推理脚本开箱可用性 | 用实际 PIPAL22 checkpoint 文件验证。 |
+| layout transpose/rearrange 多 | 能保持 view 的保持 view；真实 transpose 尝试持久 layout 或在图模式中折叠 | 降低 MTE/FixPipe 和 transpose kernel 开销 | 需要 CANN profiler 的 GM bytes 与 transpose kernel 对比。 |
+| CPU 图像预处理 | DataLoader worker 亲和后四卡 CPU range；批量 H2D；必要时评估 DVPP/AscendCL 预处理 | 避免真实训练时 CPU pipeline 吞吐不足 | 用真实数据集跑端到端吞吐，不用合成样例外推。 |
 
-数据集路径覆盖了项目主要功能面。`Koniq10k`、`Kadid10k`、`PIPAL` 三个训练 Dataset 均能从合成图片和标签生成 `3x224x224 float32` tensor；`PIPAL22` 推理 Dataset 能读取目录图片并保留原始尺寸，真实进入模型前需要通过 `inference.eval_epoch` 的 five-point crop 转成 `224x224`。这点很重要，因为 ViT patch embedding 固定检查输入高度和宽度必须等于 224。
-
-Profiler 结果与模型结构匹配。一次 NPU forward 中耗时靠前的 kernel 为：
-
-| Kernel | 调用次数 | 总耗时 |
-| --- | ---: | ---: |
-| `aclnnAddmm_MatMulV3Common_MatMulV3` | 90 | 约 `2806 us` |
-| `aclnnMatmul_BatchMatMulV3Nd_BatchMatMulV3` | 40 | 约 `818 us` |
-| `aclnnConvolution_Conv2dWithFlag_Conv2DV2` | 7 | 约 `690 us` |
-| `aclnnMatmul_MatMulV3Common_MatMulV3` | 14 | 约 `637 us` |
-| `aclnnMuls_MulAiCore_Mul` | 28 | 约 `366 us` |
-| `aclnnAdd_AddAiCore_Add` | 67 | 约 `355 us` |
-| `aclnnMatmul_TransposeAiCore_Transpose` | 30 | 约 `330 us` |
-| `aclnnSoftmax_SoftmaxAiCore_SoftmaxV2` | 24 | 约 `241 us` |
-| `aclnnLayerNormWithImplMode_LayerNormV4` | 41 | 约 `156 us` |
-| `aclnnGelu_Gelu_Gelu` | 20 | 约 `136 us` |
-
-这说明 MANIQA 的重算子主要落在 NPU 的矩阵计算、卷积和向量激活归一化路径上。结合 Ascend 950 NPU 架构白皮书，950PR 的 Cube Core 面向矩阵和 tensor 计算，Vector Core 面向 Softmax/GELU 等向量算子，并支持 BF16/FP16/TF32/FP8 等低精度格式；MANIQA 的主干算子与这些能力匹配。
-
-## fallback 与性能风险
-
-实测中有几类风险不会阻断单卡功能正确性，但会影响“纯 NPU”和性能判断。
-
-| 路径 | 观察 | 影响 |
-| --- | --- | --- |
-| 图像预处理 | Dataset 和单图预测使用 OpenCV/NumPy 做读取、resize、随机 crop、normalize，再将 tensor 送 NPU。 | 真实训练和批量推理可能被 CPU 数据管线限制，不能只看模型 forward 时间。 |
-| score head | `models/maniqa.py` 逐样本循环计算 `fc_score/fc_weight`，并反复 `torch.cat`。 | 功能正确，但会制造小 kernel 和 host dispatch；batch 越大越不利。 |
-| eager launch | batch 1 约 `13.78 ms/image`，batch 8 降到约 `2.12 ms/image`。 | 说明单图 eager 模式 launch 占比明显，服务化推理应优先 batch 化或后续再评估图模式。 |
-| BF16 autocast | BF16 autocast smoke 通过，但最终 score tensor 仍为 `float32`。 | 不能据此声称 BF16 已带来性能或显存收益，需要逐层 dtype/profiler 复查。 |
-| NumPy 2.x | 当前 venv 为 `numpy 2.4.6`，vendored `timm/data/mixup.py` 仍有 `np.bool`。 | 默认 MANIQA 路径未触发，但如果启用 timm mixup/augment 路径会有兼容风险。 |
-| TensorBoard | 训练入口 import `torch.utils.tensorboard.SummaryWriter`。 | 未安装 `tensorboard` 时训练脚本 import 即失败；已在当前环境补装，并补充到 `requirements.txt`。 |
-| 固定输入尺寸 | ViT patch embed 要求输入为 `224x224`。 | PIPAL22 原图或任意小图不能直接进模型，必须 resize/crop；`predict_one_image.Image` 对高度或宽度刚好等于 224 的图片也存在 `np.random.randint(0, 0)` 风险。 |
-| 输出排序 | 原 `sort_file` 写 `./output.txt`。 | 已修复为原地排序指定文件；否则 PIPAL22 复现产物会落错目录。 |
-
-还观察到两个 warning。`torch.meshgrid` 未来需要显式传入 `indexing` 参数，这来自 Swin/timm 路径，当前不影响运行。NPU backward 中出现 `Cannot create tensor with interal format... base format`，当前未造成失败，但说明部分 tensor factory 未走内部优化格式，后续做性能分析时应保留这个线索。
+基于等价重写后的亲和性刷新：score head 向量化和 20-crop batch 化都不改变 MANIQA 数学语义，属于优先级最高的安全改造；TorchAir 图模式和 layout 持久化需要先解决环境或 profiler 证据，不应先写成确定收益。
 
 ## 阻塞项分析
 
@@ -66,31 +109,17 @@ Profiler 结果与模型结构匹配。一次 NPU forward 中耗时靠前的 ker
 | PIPAL22 推理 checkpoint 形态 | `predict_one_image.py` 使用 state dict 构建模型；`inference.py` 当前按完整模型对象 `torch.load(config.model_path)` 使用 | PIPAL22 challenge 推理脚本的开箱可用性 | 属于 checkpoint 格式契约不明确；如果实际 checkpoint 是 state dict，需要补模型构建和 `load_state_dict` 分支。 |
 | 固定输入尺寸与真实图像预处理 | ViT patch embed 要求 `224x224` 输入；PIPAL22 原图需要通过 five-point crop 后进入模型 | 任意尺寸图片推理、PIPAL22 批量推理、服务化输入校验 | 属于前处理契约阻塞；推理入口必须显式 resize/crop 或拒绝不合规输入。 |
 
-真实数据集指标复现仍被数据路径阻塞。`train_maniqa.py` 和 `inference.py` 默认使用固定数据目录，这些目录在当前复现环境中不可用。本轮只能验证 Dataset 解析、transform、训练循环和推理入口的功能正确性，不能声称已经复现 README 中 Koniq10k、KADID-10K 或 PIPAL22 的 SRCC/PLCC。
+## 待测清单
 
-多卡训练当前被底层运行栈阻塞。`ASCEND_RT_VISIBLE_DEVICES=4,5,6,7` 能正确限制可见设备，但 `nn.DataParallel` 在 NPU 上失败；进一步用两进程 HCCL 做最小 `all_reduce` 也在 `HCCLUtils.cpp:140` 报 error code `4`。因此在 HCCL 独立 all-reduce 修复前，不应把 MANIQA 训练迁移到 DDP，也不能把失败归因到 MANIQA 模型本身。
-
-TorchAir 图模式当前不可用。`torchair` 已安装，`torchair.get_npu_backend()` 可调用，但 tiny model 和 MANIQA 的 `torch.compile` 都在 GE/TBE 初始化阶段失败，报错涉及 `InitCannKB`、`tbe-custom`、`GEInitializeV2` 和 `ERR03005 GRAPH internal error`。这说明当前容器环境还不满足 TorchAir 编译运行条件，不能把图模式作为本轮复现基线。
-
-PIPAL22 推理 checkpoint 格式也需要明确。`predict_one_image.py` 加载的是 state dict，并手动构建 MANIQA；`inference.py` 当前逻辑是 `torch.load(config.model_path)` 后直接把结果当完整模型对象使用。本轮用随机完整模型对象验证了 `inference.eval_epoch` 和输出文件路径，但如果实际 PIPAL22 checkpoint 是 state dict，`inference.py` 还需要补一个与 `predict_one_image.py` 一致的模型构建和 `load_state_dict` 分支。
-
-固定输入尺寸是推理链路的显式前处理约束。MANIQA 的 ViT patch embed 会检查输入高度和宽度必须为 `224x224`，因此 PIPAL22 原图或任意尺寸用户图片不能直接进入模型。本轮 PIPAL22 入口通过 `inference.eval_epoch` 的 five-point crop 验证可行，但后续如果要做通用推理服务，应在入口处明确 resize/crop 策略和小图拒绝逻辑。
-
-## 适配建议
-
-后续如果要把这套复现推进到可交付的 NPU 适配，优先级应放在能直接提升可用面和可解释性的点上。
-
-第一，向量化 `MANIQA.forward` 的 score aggregation，避免逐样本 Python loop 和反复 `torch.cat`。等价实现可以把 `fc_score(x)` 和 `fc_weight(x)` 保持为 `[B, N, 1]`，再按 `dim=(1, 2)` 求和得到每个 batch 样本的质量分。改完后需要用五张 README 示例图回归分数。
-
-第二，把路径、checkpoint 格式和运行模式从源码常量变成 CLI/config。至少应覆盖 `image_path`、`ckpt_path`、`dataset_name`、三类数据目录、PIPAL22 `test_dis_path`、`model_path`、`num_workers`、`batch_size`、`num_crops` 和 `vit_pretrained`。这能避免为了换数据集或 checkpoint 反复改源码。
-
-第三，继续收敛依赖兼容性。当前训练入口实际需要的 `tensorboard` 已补充到 `requirements.txt`；当前环境的 `numpy 2.4.6` 对旧 timm 代码仍存在风险，建议要么固定 `numpy<2`，要么修掉 vendored timm 中的 `np.bool` 等旧别名。
-
-第四，真实训练先保持单 NPU。后四卡 CPU affinity 在 topology 中对应 `64-127,192-255`，真实数据训练时应在这个 CPU 范围内测试 DataLoader worker 数量、prefetch 和 batch size。只有当最小 HCCL `all_reduce` 通过后，再考虑 DDP。
-
-第五，TorchAir 作为独立优化阶段处理。先用 tiny model 证明 `torch.compile(..., backend=torchair.get_npu_backend())` 能工作，再评估 MANIQA 的静态 shape 推理。不要在 tiny compile 失败时直接调 MANIQA 图模式。
-
-第六，补 NPU smoke 脚本，作为后续每次同步后的最小验收。脚本应覆盖后四卡 device guard、checkpoint 单图预测、随机 batch forward、训练一步、PIPAL22 two-image inference、profiler 可启动，并在多卡/HCCL/TorchAir 失败时输出明确的环境阻塞原因。
+| 待测项 | 目的 | 建议方法 |
+| --- | --- | --- |
+| FP32/BF16/FP16 roofline microbench | 确认 950PR 在当前 torch_npu 栈下的实际 Cube/Vector 平衡点 | 对 MatMul、BatchMatMul、Softmax、LayerNorm、GELU 分 dtype 做 microbench，记录 FLOPs、GM bytes、AIC/AIV 时间。 |
+| profiler GM bytes 与 tile 利用率 | 验证上文 roofline 初判 | 用 CANN profiler 展开 kernel 级 GM 读写、AIC/AIV 时间、transpose bytes。 |
+| score head 向量化 | 降低 host/head 和小 kernel 开销 | 改写后跑 README 五图、batch 1/4/8 profiler 对比。 |
+| 20-crop batch 化 | 提升单图预测吞吐 | 对比串行 20 次 forward 和 batch forward 的分数、时延、峰值显存。 |
+| HCCL 最小 all_reduce | 解锁 DDP 判断 | 先跑两进程 NPU tensor `all_reduce`，通过后再测 MANIQA DDP。 |
+| TorchAir tiny compile | 解锁图模式判断 | 先让 tiny Linear/MLP compile 通过，再评估 MANIQA 静态 shape。 |
+| 真实数据 DataLoader affinity | 判断端到端训练瓶颈 | 在后四卡 CPU affinity 范围内扫 `num_workers`、batch size、prefetch。 |
 
 ## 资料来源
 
