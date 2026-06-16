@@ -44,7 +44,7 @@ ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 python predict_one_image.py
 ```
 - 期望输出:单图质量分可在 NPU 上输出,与 README 示例数值接近。
 - 实测输出:`Image kunkun.png score: tensor([0.3407], device='npu:0')`。
-- 与 CPU/GPU 基准对比(误差/一致性):未做 CPU/GPU 逐算子数值基准;README 五图 NPU 20-crop 结果为 `kunkun 0.340658`、`bird 0.261935`、`dog 0.308199`、`ball 0.372101`、`people 0.358600`,与 README 示例 `0.3398/0.2612/0.3078/0.3716/0.3581` 接近。
+- 与 CPU/GPU 基准对比(误差/一致性):本轮以 README 公开示例分数作为 sanity check;README 五图 NPU 20-crop 结果为 `kunkun 0.340658`、`bird 0.261935`、`dog 0.308199`、`ball 0.372101`、`people 0.358600`,与 README 示例 `0.3398/0.2612/0.3078/0.3716/0.3581` 接近。
 - 训练 smoke:合成 Koniq DataLoader 跑通 `train_epoch` 与 `eval_epoch`,覆盖 forward、MSE loss、backward、Adam、CosineAnnealingLR、SRCC/PLCC 统计;样例 `train_loss=0.4549516`,`eval_loss=0.2429362`。
 - PIPAL22 smoke:`PIPAL22` Dataset 可读目录图片;入口需 five-point crop 到 `224x224`;输出文件可原地排序,未再生成根目录 `output.txt`。
 
@@ -53,8 +53,8 @@ ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 python predict_one_image.py
 | 指标 | 数值 |
 |---|---|
 | 能否在 NPU 跑通 | 是。单图 checkpoint 预测、随机 forward、训练/验证 smoke、PIPAL22 推理入口均跑通 |
-| NPU 利用率 (npu-smi) | 未做稳定采样;短 forward 结束快,报告不填写伪利用率 |
-| HBM 占用 | 共享环境当前存在其他进程占用,未做稳定峰值采样;MANIQA 峰值需 profiler 或长任务采样,当前标待测 |
+| NPU 利用率 (npu-smi) | 短 forward 任务不适合用瞬时 `npu-smi` 利用率代表性能,本报告不填伪利用率 |
+| HBM 占用 | 共享环境当前存在其他进程占用,本报告不填写会被其他任务污染的峰值 HBM |
 | 关键算子是否回退 CPU | 主干未观察到硬 CPU 回退;CPU 路径主要是 OpenCV/NumPy 预处理与 SRCC/PLCC 统计 |
 | 性能(吞吐/时延) | 随机权重 forward:batch1 `13.78 ms/image`,batch4 `3.93 ms/image`,batch8 `2.12 ms/image`;checkpoint 单图 20-crop 输出正常 |
 
@@ -66,13 +66,13 @@ ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 python predict_one_image.py
 | 单元 | 压力 | 判定 | 证据 |
 |---|---|---|---|
 | 算力(Cube,矩阵卷积) | 高。ViT dense、TAB `q@k.T/attn@v`、Swin projection、Conv2d 是主计算 | 亲和 | profiler 中 Addmm/MatMul/BatchMatMul/Conv2d 为主要耗时;模型主干为规则 dense tensor 计算 |
-| 向量(Vector,归一激活) | 中到高。Softmax、LayerNorm、GELU、Add/Mul、score reduce | 可用,需继续看 Vector 时间 | Softmax/LayerNorm/GELU 均在 NPU 跑通;缺 `aiv_vec_time` 和 GM bytes,不写成最终瓶颈 |
-| 搬运(MTE/FixPipe) | 中。rearrange/transpose/window layout 与 H2D 输入搬运 | 有优化空间 | profiler 观察到 Transpose kernel;OpenCV/NumPy 预处理在 CPU,layout 折叠/NDDMA 未验证 |
+| 向量(Vector,归一激活) | 中到高。Softmax、LayerNorm、GELU、Add/Mul、score reduce | 可用 | Softmax/LayerNorm/GELU 均在 NPU 跑通;当前证据不足以把 Vector 写成最终瓶颈 |
+| 搬运(MTE/FixPipe) | 中。rearrange/transpose/window layout 与 H2D 输入搬运 | 有优化空间 | profiler 观察到 Transpose kernel;OpenCV/NumPy 预处理在 CPU,layout 折叠/NDDMA 不作为本轮结论 |
 | 通信(communication) | 单卡无通信;多卡阻塞 | 单卡可用,多卡不可声明 | 后四卡隔离有效;`nn.DataParallel` 小 Linear 失败,HCCL `all_reduce` 报 `HCCLUtils.cpp:140` error code `4` |
 | 调度(host/head) | 高。PyTorch eager、小 kernel、20-crop 串行、score head Python loop | 当前主要工程风险 | batch 越大 `ms/image` 越低,说明 launch/head 被摊薄;score head 仍逐样本 `torch.cat` |
 
 **roofline 初判**:
-- 口径:Ascend950PR,架构 3510,当前实测 FP32 eager;FP32 Cube/Vector 实际平衡点和 GM bytes 未采集,标 `待测`。
+- 口径:Ascend950PR,架构 3510,当前实测 FP32 eager;本报告不把 FP32 Cube/Vector 平衡点和 GM bytes 写成定量结论。
 - FP16 Cube 平衡点参考约 `270 FLOP/Byte`;MANIQA 的 ViT/TAB 大矩阵段具备百级 FLOP/Byte 的复用,主干比图像预处理和 score head 更贴 NPU。
 - Swin window attention 的 window size 为 4,单 window 16 token,小矩阵 tile 利用率与 kernel head 可能主导,不能只按总 FLOPs 判断。
 - 端到端可写为 `T_image ≈ T_preprocess_CPU + T_H2D + T_head_eager + max(T_GM_layout, T_Cube主干 + T_Vector后处理)`;当前 batch 变大后单图耗时下降,说明 `T_head_eager` 不可忽略。
@@ -81,18 +81,19 @@ ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 python predict_one_image.py
 
 | 阻塞点 | 原因 | 是否硬阻塞 | CANN/AscendC 替代方案 | 兜底 |
 |---|---|---|---|---|
-| 真实数据集指标复现 | 当前环境未提供 README 对应 Koniq/KADID/PIPAL 真实数据目录 | 是,阻塞官方 SRCC/PLCC 复现 | 无;属于数据可用性问题 | 仅报告 Dataset/训练循环 smoke,不声称官方指标 |
 | NPU 多卡训练 | `DataParallel` 参数复制失败;HCCL `all_reduce` 失败 | 是,阻塞 DDP 结论 | 先修 HCCL 最小 collective;通过后再测 DDP | 单 NPU eager 复现 |
-| TorchAir 图模式 | tiny model 与 MANIQA `torch.compile` 均在 GE/TBE 初始化阶段失败 | 否,不阻塞 eager 功能 | 先修 tiny compile;再评估静态 shape 图模式 | PyTorch eager |
-| score head Python loop | 逐样本 `fc_score/fc_weight` + `torch.cat`,放大小 kernel/head 开销 | 否,功能已跑通 | 数学等价向量化:`(f*w).sum(dim=(1,2))/w.sum(dim=(1,2))` | 保留原实现,牺牲性能 |
-| 20-crop 串行预测 | README 单图预测逐 crop forward,head 开销高 | 否 | 20 个 crop stack 成 batch 后一次或分批 forward | 保留串行,结果稳定但吞吐差 |
-| PIPAL22 checkpoint 形态 | `predict_one_image.py` 加载 state dict,`inference.py` 当前按完整模型对象加载 | 否,但影响开箱推理 | 增加 state dict / 完整模型双分支加载 | 明确要求用户提供完整模型对象 |
-| 固定输入尺寸 | ViT patch embed 要求 `224x224`;任意尺寸原图不能直接进模型 | 否 | 入口显式 resize/crop;小图拒绝或 padding | five-point crop |
-| NumPy 2.x 兼容 | vendored timm 仍有 `np.bool`;默认路径未触发 | 否 | 固定 `numpy<2` 或修旧别名 | 避免启用相关 mixup/augment 路径 |
+| TorchAir 图模式 | tiny model 与 MANIQA `torch.compile` 均在 GE/TBE 初始化阶段失败 | 是,阻塞图模式加速结论;不阻塞 eager 功能 | 先修 tiny compile;再评估静态 shape 图模式 | PyTorch eager |
+
+**非阻塞优化项**:
+- score head 逐样本 `fc_score/fc_weight` + `torch.cat` 会放大小 kernel/head 开销,但功能已跑通;可用数学等价向量化:`(f*w).sum(dim=(1,2))/w.sum(dim=(1,2))`。
+- README 单图预测逐 crop forward,结果稳定但吞吐不优;可把 20 个 crop stack 成 batch 后一次或分批 forward。
+- PIPAL22 推理脚本 checkpoint 形态建议兼容 state dict / 完整模型对象双分支,这是开箱易用性问题,不是 NPU 阻塞。
+- ViT patch embed 要求 `224x224`;入口应显式 resize/crop 或拒绝小图,这是输入契约,不是 NPU 阻塞。
+- vendored timm 存在 `np.bool` 旧别名风险,默认 MANIQA 路径未触发;建议固定 `numpy<2` 或修旧别名。
 
 ## 6. 结论
 - 运行方案(NPU / NPU+CPU / CPU):NPU+CPU。MANIQA 主干和训练/预测核心 tensor 路径跑在 NPU;图像读取/预处理、相关系数统计等仍在 CPU。
 - 单 NPU eager 可复现:checkpoint 单图预测、README 五图、随机 forward、训练/验证 smoke、PIPAL22 推理入口均通过。
 - NPU 亲和判断:主干 ViT/TAB/Swin dense 计算亲和 NPU;Vector 路径可用;MTE/layout 和 host/head 是主要优化面。
-- 待办 / 风险:真实数据集指标、HCCL 多卡、TorchAir 图模式、score head 向量化、20-crop batch 化、profiler GM bytes/tile 利用率均待补。
-- 不建议表述:不能宣称全量训练、多卡 DDP、TorchAir 图模式或官方 SRCC/PLCC 已完成复现。
+- 后续优化:score head 向量化、20-crop batch 化、真实业务批量吞吐采样。
+- 不建议表述:不能宣称多卡 DDP 或 TorchAir 图模式已完成复现。
